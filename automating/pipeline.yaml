@@ -1,0 +1,526 @@
+Parameters:
+  OutputArtifact:
+    Type: String
+    Description: Name of the OutputArtifact
+    Default: MyAppMXNet
+  OutputArtifactBuild:
+    Type: String
+    Description: Name of the OutputArtifactBuild
+    Default: MyAppBuildMXNet
+  PipelineName:
+    Type: String
+    Description: Name of the Pipeline
+    Default: LambdaPipelineMXNet
+  CodeBuildName:
+    Type: String
+    Description: Name of the CodeBuild project
+    Default: SMSLambdaBuilderMXNet
+  SourceS3Bucket:
+    Type: String
+    Description: Name of the SourceS3Bucket where the model zip file is contained
+    Default: smlambda-workshop-dn
+  SourceS3ObjectKey:
+    Type: String
+    Description: Name of the model zip file to monitor
+    Default: model.tar.gz
+  CodeBuildZip:
+    Type: String
+    Description: Name of the empty zip file
+    Default: empty.zip
+  LambdaStackName:
+    Type: String
+    Description: Name of the Lambda stack
+    Default: AntiSpamAPIMXNet
+
+
+Resources:
+  S3BucketCloudTrail:
+    DeletionPolicy: Retain
+    Type: 'AWS::S3::Bucket'
+    Properties: {}
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref S3BucketCloudTrail
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref S3BucketCloudTrail
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref S3BucketCloudTrail
+                - /AWSLogs/
+                - !Ref 'AWS::AccountId'
+                - /*
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+  
+  myTrail:
+    DependsOn:
+      - BucketPolicy
+    Type: 'AWS::CloudTrail::Trail'
+    Properties:
+      S3BucketName: !Ref S3BucketCloudTrail
+      EventSelectors:
+        - IncludeManagementEvents: true
+          DataResources:
+            - Values:
+                - !Join 
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref ModelS3Location
+                    - /
+                    - !Ref SourceS3ObjectKey
+              Type: 'AWS::S3::Object'
+            - Values:
+                - !Join 
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref SourceS3Bucket
+                    - /
+              Type: 'AWS::S3::Object'
+          ReadWriteType: WriteOnly
+      IsLogging: true
+
+
+  SMSCWEvent:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: >-
+        Amazon CloudWatch Events rule to automatically start your pipeline when
+        a change occurs in the AWS CodeCommit source repository and branch.
+      EventPattern: !Sub 
+        - >-
+          {"source":["aws.s3"],"detail-type":["AWS API Call via
+          CloudTrail"],"detail":{"eventSource":["s3.amazonaws.com"],"eventName":["PutObject",
+          "CopyObject"
+          ],"resources":{"ARN":["arn:aws:s3:::${ModelS3Location}/${SourceS3ObjectKey}"]}}}
+        - SourceS3Bucket: !Ref ModelS3Location
+          SourceS3ObjectKey: !Ref SourceS3ObjectKey
+      Targets:
+        - Arn: !Join 
+            - ''
+            - - 'arn:aws:codepipeline:'
+              - !Ref 'AWS::Region'
+              - ':'
+              - !Ref 'AWS::AccountId'
+              - ':'
+              - !Ref LambdaPipeline
+          Id: LambdaPipeline
+          RoleArn: !GetAtt 
+            - CwIamRole
+            - Arn
+      State: ENABLED
+
+
+  LambdaCopyModelIAM:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: Lambda-Copy-Model-IAM-Copy-S3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - '*'
+  LambdaCopyModel:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: !Ref SourceS3Bucket
+        S3Key: lambdaCopyModel.zip
+      Description: It gets a model and move it to the pipeline bucket
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref ModelS3Location
+          FILE_MODEL_NAME: !Ref SourceS3ObjectKey
+          SOURCE_BUCKET: !Ref SourceS3Bucket
+      Handler: lambdaCopyModel.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 
+        - LambdaCopyModelIAM
+        - Arn
+      Runtime: python2.7
+      Timeout: 2
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      FunctionName: !GetAtt 
+        - LambdaCopyModel
+        - Arn
+      SourceArn: !GetAtt 
+        - SMSModelCWEvent
+        - Arn
+
+
+
+  SMSModelCWEvent:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: >-
+        Amazon CloudWatch Events rule to automatically start your pipeline when
+        a change occurs in the AWS CodeCommit source repository and branch.
+      EventPattern: !Sub 
+        - >-
+          {"source":["aws.s3"],"detail-type":["AWS API Call via
+          CloudTrail"],"detail":{"eventSource":["s3.amazonaws.com"],"eventName":["PutObject",
+          "CopyObject"
+          ],"requestParameters":{"bucketName":["${SourceS3Bucket}"]}}}
+        - SourceS3Bucket: !Ref SourceS3Bucket
+      Targets:
+        - Arn: !GetAtt 
+            - LambdaCopyModel
+            - Arn
+          Id: LambdaPipeline
+      State: ENABLED
+
+
+
+
+
+  ModelS3Location:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+  ArtifactStoreS3Location:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+  CwIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: CW-SMS-Antispam-CodeBuild-Policy-CodePipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codepipeline:StartPipelineExecution'
+                Resource:
+                  - '*'
+        - PolicyName: CW-SMS-Antispam-CodeBuild-Policy-Lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - '*'
+  SMSCodeBuildRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: SMS-Antispam-CodeBuild-Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+  SMSCodePipelineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: SMS-Antispam-CodePipeline-Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketVersioning'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 's3:PutObject'
+                Resource:
+                  - 'arn:aws:s3:::codepipeline*'
+                  - 'arn:aws:s3:::elasticbeanstalk*'
+                Effect: Allow
+              - Action:
+                  - 'codecommit:CancelUploadArchive'
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:UploadArchive'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetApplicationRevision'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentConfig'
+                  - 'codedeploy:RegisterApplicationRevision'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 'elasticbeanstalk:*'
+                  - 'ec2:*'
+                  - 'elasticloadbalancing:*'
+                  - 'autoscaling:*'
+                  - 'cloudwatch:*'
+                  - 's3:*'
+                  - 'sns:*'
+                  - 'cloudformation:*'
+                  - 'rds:*'
+                  - 'sqs:*'
+                  - 'ecs:*'
+                  - 'iam:PassRole'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:ListFunctions'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 'opsworks:CreateDeployment'
+                  - 'opsworks:DescribeApps'
+                  - 'opsworks:DescribeCommands'
+                  - 'opsworks:DescribeDeployments'
+                  - 'opsworks:DescribeInstances'
+                  - 'opsworks:DescribeStacks'
+                  - 'opsworks:UpdateApp'
+                  - 'opsworks:UpdateStack'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:DescribeChangeSet'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:SetStackPolicy'
+                  - 'cloudformation:ValidateTemplate'
+                  - 'iam:PassRole'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*'
+                Effect: Allow
+  CodeBuildProject:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      TimeoutInMinutes: 10
+      Name: !Ref CodeBuildName
+      ServiceRole: !GetAtt 
+        - SMSCodeBuildRole
+        - Arn
+      Tags: []
+      Artifacts:
+        NamespaceType: NONE
+        Packaging: NONE
+        Type: CODEPIPELINE
+        Name: !Ref CodeBuildName
+      Cache:
+        Type: NO_CACHE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: false
+        Image: 'aws/codebuild/ubuntu-base:14.04'
+        Type: LINUX_CONTAINER
+        EnvironmentVariables: []
+      Source:
+        BuildSpec: !Sub 
+          - |-
+            version: 0.2
+
+            phases:
+              build:
+                commands:
+                  - "git clone https://github.com/diegonat/smwshop.git"
+                  - "cd smwshop "
+                  - "rm -rf .git "
+                  - "ls -al "
+                  - "aws s3 cp s3://${SourceBucket}/${SourceS3ObjectKey} ."
+                  - "tar zxf ${SourceS3ObjectKey}"
+                  - "ls -al"
+                  - "pwd"
+                  - "rm -f ${SourceS3ObjectKey}"
+                  - "aws cloudformation package --template-file samTemplateCodeDeploy.yaml --s3-bucket ${SourceBucket} --output-template-file ../outputSamTemplate.yaml"
+                  - "cp samTemplateCodeDeploy.yaml ../"
+
+            artifacts:
+              type: zip
+              files:
+                - outputSamTemplate.yaml
+                - samTemplateCodeDeploy.yaml
+          - SourceBucket: !Ref ModelS3Location
+            SourceS3ObjectKey: !Ref SourceS3ObjectKey
+        InsecureSsl: false
+        Type: CODEPIPELINE
+      BadgeEnabled: false
+      Description: Create Lambda deploying package
+  LambdaPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt 
+        - SMSCodePipelineRole
+        - Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: '1'
+                Provider: S3
+              OutputArtifacts:
+                - Name: !Ref OutputArtifact
+              Configuration:
+                S3Bucket: !Ref SourceS3Bucket
+                PollForSourceChanges: 'false'
+                S3ObjectKey: !Ref CodeBuildZip
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - InputArtifacts:
+                - Name: !Ref OutputArtifact
+              Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: !Ref OutputArtifactBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildName
+              RunOrder: 1
+        - Name: ExecuteChangeSet
+          Actions:
+            - InputArtifacts:
+                - Name: !Ref OutputArtifactBuild
+              Name: SMSspam
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              OutputArtifacts: []
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: SMSspam
+                RoleArn: !GetAtt 'CloudFormationRole.Arn'
+                Capabilities: CAPABILITY_IAM
+                StackName: !Ref LambdaStackName
+                TemplatePath: !Sub 
+                  - '${Artifact}::outputSamTemplate.yaml'
+                  - Artifact: !Ref OutputArtifactBuild
+              RunOrder: 1
+        - Name: ExecuteCF
+          Actions:
+            - InputArtifacts: []
+              Name: Execute
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              OutputArtifacts: []
+              Configuration:
+                StackName: !Ref LambdaStackName
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: SMSspam
+              RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStoreS3Location
+      Name: !Ref PipelineName
+
+
+  CloudFormationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'cloudformation.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
